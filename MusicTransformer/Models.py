@@ -3,15 +3,15 @@ import numpy as np
 
 
 def create_padding_mask(seq):
-  seq = tf.cast(tf.math.equal(seq, 0), tf.float32)
-  
-  # add extra dimensions to add the padding
-  # to the attention logits.
-  return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
+    seq = tf.cast(tf.math.equal(seq, 1), tf.float32)
+
+    # add extra dimensions to add the padding
+    # to the attention logits.
+    return seq[:, tf.newaxis, tf.newaxis, :]  # (batch_size, 1, 1, seq_len)
 
 
 def create_look_ahead_mask(size):
-    mask = 1 - tf.linalg.band_part(tf.ones((size, size)), -1, 0)
+    mask = tf.linalg.band_part(tf.ones((size, size)), -1, 0)
     return mask  # (seq_len, seq_len)
 
 
@@ -30,9 +30,10 @@ class RelativeGlobalAttention(tf.keras.layers.Layer):
         self.d_model = d_model
         self.headDim = d_model // num_heads
         self.contextDim = int(self.headDim * self.num_heads)
+        self.eventDim = 388
 
         assert d_model % self.num_heads == 0
-        
+
         self.wq = tf.keras.layers.Dense(self.headDim)
         self.wk = tf.keras.layers.Dense(self.headDim)
         self.wv = tf.keras.layers.Dense(self.headDim)
@@ -42,8 +43,6 @@ class RelativeGlobalAttention(tf.keras.layers.Layer):
         q = tf.stack([self.wq(q) for _ in range(self.num_heads)])
         k = tf.stack([self.wk(k) for _ in range(self.num_heads)])
         v = tf.stack([self.wv(v) for _ in range(self.num_heads)])
-        print("inputs")
-        print("[Heads, Batch, Time, HeadDim]", q.shape)
 
         self.batch_size = q.shape[1]
         self.max_len = q.shape[2]
@@ -64,38 +63,33 @@ class RelativeGlobalAttention(tf.keras.layers.Layer):
         # [Heads, Batch, Time, Time]
         S = S[:, :, 1:]
         # [Heads, Batch, Time, Time]
-        attention = (tf.matmul(q, k, transpose_b=True) + S) / np.sqrt(self.depth)
-        
+        attention = (tf.matmul(q, k, transpose_b=True) + S) / np.sqrt(self.headDim)
         # mask tf 2.0 == tf.linalg.band_part
 #         mask = tf.linalg.band_part(tf.ones([self.max_len, self.max_len]), -1, 0)
-        attention = attention * mask - tf.cast(1e10, attention.dtype) * (1-mask)
-        
+        if mask is not None:
+            attention = attention * mask - tf.cast(1e10, attention.dtype) * (1-mask)
         score = tf.nn.softmax(attention, axis=3)
-        print("Score : ", score.shape)
 
         # [Heads, Batch, Time, HeadDim]
         context = tf.matmul(score, v)
-        print("[Heads, Batch, Time, HeadDim] : ", context.shape)
         # [Batch, Time, Heads, HeadDim]
         context = tf.transpose(context, [1, 2, 0, 3])
-        print("[Batch, Time, Heads, HeadDim] : ", context.shape)        
         # [Batch, Time, ContextDim]
         context = tf.reshape(context, [self.batch_size, self.max_len, self.num_heads * self.headDim])
-        print("[Batch, Time, ContextDim] : ", context.shape)
         # [Batch, Time, ContextDim]
-        context = tf.keras.layers.Dense(EmbeddingDim, activation='relu')(context)
-        print("[Batch, Time, ContextDim] : ", context.shape)     
+#         context = tf.keras.layers.Dense(self.d_model, activation='relu')(context)
         # [Batch, Time, EventDim]
-        logits = tf.keras.layers.Dense(EventDim)(context)
+#         logits = tf.keras.layers.Dense(self.eventDim)(context)
+        logits = tf.keras.layers.Dense(self.d_model)(context)
 
-        return logits
+        return logits, score
       
 
 class EncoderLayer(tf.keras.layers.Layer):
     def __init__(self, d_model, num_heads, dff, rate=0.1):
         super(EncoderLayer, self).__init__()
 
-        self.mha = MultiHeadAttention(d_model, num_heads)
+        self.rga = RelativeGlobalAttention(d_model, num_heads)
         self.ffn = point_wise_feed_forward_network(d_model, dff)
 
         self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
@@ -105,8 +99,7 @@ class EncoderLayer(tf.keras.layers.Layer):
         self.dropout2 = tf.keras.layers.Dropout(rate)
 
     def call(self, x, training, mask):
-
-        attn_output, _ = self.mha(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
+        attn_output, _ = self.rga(x, x, x, mask)  # (batch_size, input_seq_len, d_model)
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.layernorm1(x + attn_output)  # (batch_size, input_seq_len, d_model)
 
@@ -121,8 +114,8 @@ class DecoderLayer(tf.keras.layers.Layer):
     def __init__(self, d_model, num_heads, dff, rate=0.1):
         super(DecoderLayer, self).__init__()
 
-        self.mha1 = MultiHeadAttention(d_model, num_heads)
-        self.mha2 = MultiHeadAttention(d_model, num_heads)
+        self.rga1 = RelativeGlobalAttention(d_model, num_heads)
+        self.rga2 = RelativeGlobalAttention(d_model, num_heads)
 
         self.ffn = point_wise_feed_forward_network(d_model, dff)
 
@@ -139,11 +132,11 @@ class DecoderLayer(tf.keras.layers.Layer):
              look_ahead_mask, padding_mask):
         # enc_output.shape == (batch_size, input_seq_len, d_model)
 
-        attn1, attn_weights_block1 = self.mha1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
+        attn1, attn_weights_block1 = self.rga1(x, x, x, look_ahead_mask)  # (batch_size, target_seq_len, d_model)
         attn1 = self.dropout1(attn1, training=training)
         out1 = self.layernorm1(attn1 + x)
 
-        attn2, attn_weights_block2 = self.mha2(
+        attn2, attn_weights_block2 = self.rga2(
             enc_output, enc_output, out1, padding_mask)  # (batch_size, target_seq_len, d_model)
         attn2 = self.dropout2(attn2, training=training)
         out2 = self.layernorm2(attn2 + out1)  # (batch_size, target_seq_len, d_model)
@@ -164,8 +157,8 @@ class Encoder(tf.keras.layers.Layer):
         self.num_layers = num_layers
 
         self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
-        self.pos_encoding = positional_encoding(maximum_position_encoding, 
-                                                self.d_model)
+#         self.pos_encoding = positional_encoding(maximum_position_encoding, 
+#                                                 self.d_model)
 
 
         self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate) 
@@ -180,7 +173,7 @@ class Encoder(tf.keras.layers.Layer):
         # adding embedding and position encoding.
         x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
         x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x += self.pos_encoding[:, :seq_len, :]
+#         x += self.pos_encoding[:, :seq_len, :]
 
         x = self.dropout(x, training=training)
 
@@ -199,7 +192,7 @@ class Decoder(tf.keras.layers.Layer):
         self.num_layers = num_layers
 
         self.embedding = tf.keras.layers.Embedding(target_vocab_size, d_model)
-        self.pos_encoding = positional_encoding(maximum_position_encoding, d_model)
+#         self.pos_encoding = positional_encoding(maximum_position_encoding, d_model)
 
         self.dec_layers = [DecoderLayer(d_model, num_heads, dff, rate) 
                            for _ in range(num_layers)]
@@ -213,7 +206,7 @@ class Decoder(tf.keras.layers.Layer):
 
         x = self.embedding(x)  # (batch_size, target_seq_len, d_model)
         x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        x += self.pos_encoding[:, :seq_len, :]
+#         x += self.pos_encoding[:, :seq_len, :]
 
         x = self.dropout(x, training=training)
 
